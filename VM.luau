@@ -52,6 +52,122 @@ local checkreg = function(a)
 	end
 end
 
+local clstr = function(str)
+	str = str:gsub("^['\"](.-)['\"]$", "%1"):gsub("^%[(=*)%[(.-)%]%1%]$", "%2")
+
+	local out = {}
+
+	for i = 1, #str do
+		local c = str:sub(i, i)
+		local b = c:byte()
+
+		if b < 32 or b == 127 then
+			out[#out + 1] = "\\" .. b
+		elseif c == "\n" then
+			out[#out + 1] = "\\n"
+		elseif c == "\r" then
+			out[#out + 1] = "\\r"
+		elseif c == "\t" then
+			out[#out + 1] = "\\t"
+		else
+			out[#out + 1] = c
+		end
+	end
+
+	str = table.concat(out)
+
+	local dq = not str:find('[\n\r\\"]')
+	local sq = not str:find("[\n\r\\']")
+
+	if dq then
+		return `"{str}"`
+	elseif sq then
+		return `'{str}'`
+	end
+
+	local eq = ""
+
+	while str:find("%]" .. eq .. "%]") do
+		eq ..= "="
+	end
+
+	return "[" .. eq .. "[" .. str .. "]" .. eq .. "]"
+end
+
+local function clidx(str)
+	str = str:gsub("^['\"](.-)['\"]$", "%1"):gsub("^%[(=*)%[(.-)%]%1%]$", "%2")
+
+	local out = {}
+
+	for i = 1, #str do
+		local c = str:sub(i, i)
+		local b = c:byte()
+
+		if b < 32 or b == 127 then
+			out[#out + 1] = "\\" .. b
+		elseif c == "\n" then
+			out[#out + 1] = "\\n"
+		elseif c == "\r" then
+			out[#out + 1] = "\\r"
+		elseif c == "\t" then
+			out[#out + 1] = "\\t"
+		else
+			out[#out + 1] = c
+		end
+	end
+
+	str = table.concat(out)
+
+	local simple = str:match("^[%a_][%w_]*$")
+
+	if simple then
+		return str, true
+	end
+
+	local dq = not str:find('[\n\r\\"]')
+	local sq = not str:find("[\n\r\\']")
+
+	if dq then
+		return `"{str}"`, false
+	elseif sq then
+		return `'{str}'`, false
+	end
+
+	local eq = ""
+
+	while str:find("%]" .. eq .. "%]") do
+		eq ..= "="
+	end
+
+	return "[" .. eq .. "[" .. str .. "]" .. eq .. "]", false
+end
+
+local mkexpr = function(t, args)
+	if t == "index" then
+		local index, simple = clidx(args.index)
+		return simple and `{args.base}.{index}` or `{args.base}[{index}]`
+	elseif t == "newindex" then
+		local index, simple = clidx(args.index)
+		return simple and `{args.base}.{index} = {args.value}` or `{args.base}[{index}] = {args.value}`
+	elseif t == "local" then
+		return `local {args.name or "_"} = {args.value or "nil"}`
+	elseif t == "len" then
+		return `#{args.base}`
+	elseif t == "call" then
+		return `{args.base}({args.args})`
+	elseif t == "tbl" then
+		local entries = args.entries
+		local s = ""
+		for i, v in pairs(entries) do
+			s ..= `{v}, `
+		end
+		return string.format("{%s}", s)
+	elseif t == "tblentry" then
+		return `[{args.index}] = {args.value}`
+	end
+	return "nil"
+end
+
 local function parsearg(arg)
 	local t = type(arg)
 	local reg = checkreg(arg)
@@ -67,19 +183,24 @@ local function parsearg(arg)
 	end
 
 	if t == "string" then
-		return `"{arg}"`
+		return clstr(arg)
 	elseif t == "number" then
 		return `{tostring(arg)}`
 	elseif t == "boolean" then
 		return `{tostring(arg)}`
 	elseif t == "table" then
-		local a = ""
+		local a = {}
 
 		for i, v in pairs(arg) do
-			a ..= `[{parsearg(i)}] = {parsearg(v)}, `
+			table.insert(a, mkexpr("tblentry", {
+				index = parsearg(i),
+				value = parsearg(v),
+			}))
 		end
 
-		return [[ {]] .. a .. [[} ]]
+		return mkexpr("tbl", {
+			entries = a
+		})
 	elseif t == "function" then
 		local a = debug.info(arg, "a")
 		local params = ""
@@ -118,9 +239,15 @@ local makecall = function(name, callback, args, add)
 	local hascallback = callback ~= nil
 	local astargs = parseargs(args)
 	local v = makevar()
-	local expr = `{name}({astargs})`
+	local expr = mkexpr("call", {
+		base = name,
+		args = astargs,
+	})
 	if add == nil or add == true then
-		out ..= `local {hascallback and v or "_"} = {expr}\n`
+		out ..= `{mkexpr("local", {
+			name = hascallback and v,
+			value = expr,
+		})}\n`
 	end
 	table.insert(registry, {
 		callback = callback,
@@ -138,10 +265,10 @@ local function makeobj(pdata, ctype, exporvar)
 		local index = mt.idx[k] or (pdata and pdata[k])
 		local expr
 		if exporvar then
-			expr = `{exporvar}[{parsearg(k)}]`
-		end
-		if index == nil then
-			index = makeobj(nil, nil, exporvar)
+			expr = mkexpr("index", {
+				base = exporvar,
+				index = parsearg(k),
+			})
 		end
 		local callback = makeobj(index, ctype, expr or exporvar)
 		table.insert(registry, {
@@ -153,7 +280,11 @@ local function makeobj(pdata, ctype, exporvar)
 
 	mt.__newindex = function(_, k, v)
 		if exporvar then
-			out ..= `{exporvar}[{parsearg(k)}] = {parsearg(v)}\n`
+			out ..= `{mkexpr("newindex", {
+				base = exporvar,
+				index = parsearg(k),
+				value = parsearg(v),
+			})}\n`
 		end
 		mt.idx[k] = v
 	end
@@ -170,7 +301,12 @@ local function makeobj(pdata, ctype, exporvar)
 		local callback = math.random(1, 20)
 		if exporvar then
 			local v = makevar()
-			out ..= `local {v} = #{exporvar}\n`
+			out ..= `{mkexpr("local", {
+				name = v,
+				value = mkexpr("len", {
+					base = exporvar,
+				}),
+			})}\n`
 			table.insert(registry, {
 				callback = callback,
 				var = v,
@@ -235,10 +371,6 @@ env.typeof = function(obj)
 	return asd
 end
 
---[[env.writefile = function(f, c)
-    return fs.writeFile(f,c)
-end]]
-
 local workspace = makeobj(nil, "Instance", "workspace")
 
 env.game = makeobj(nil, "Instance", "game")
@@ -250,7 +382,10 @@ penv = setmetatable({}, {
 		local expr, var
 		if callback == nil then
 			var = makevar()
-			expr = `fenv[{parsearg(k)}]`
+			expr = `{mkexpr("index", {
+				base = "fenv",
+				index = parsearg(k),
+			})}\n`
 			--out ..= `local {var} = {expr}\n`
 			callback = makeobj(nil, nil, expr)
 		end
@@ -262,7 +397,11 @@ penv = setmetatable({}, {
 		return callback
 	end,
 	__newindex = function(_, k, v)
-		out ..= `fenv[{parsearg(k)}] = {parsearg(v)}\n`
+		out ..= `{mkexpr("newindex", {
+			base = "fenv",
+			index = parsearg(k),
+			value = parsearg(v),
+		})}\n`
 	end,
 })
 
